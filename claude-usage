@@ -1,0 +1,465 @@
+#!/usr/bin/env bash
+# claude-usage — Claude Code plan usage framed against elapsed time in the same window.
+#
+# For each rate-limit window it prints the usage bar Claude Code's /usage shows, and
+# immediately below it a bar for how much of the window has actually elapsed. If the
+# usage bar is longer than the time bar, you're spending faster than an even split.
+#
+#   claude-usage                 live report, repainting in place every 60s
+#   claude-usage --secs 30       ...at a custom interval (a bare number works too)
+#   claude-usage --statusline    refresh the cache + print the compact one-line readout
+#   claude-usage --refresh       refresh the cache only, print NOTHING
+#
+# The live report is the default. Piped or redirected output renders ONCE instead of
+# looping, so `claude-usage | grep …` still terminates.
+#
+# Two sources feed the one cache the report reads, and they cover for each other.
+#
+# The statusLine hook is the cheap one: register it and every turn of every live session
+# refreshes the figures for free. On its own it goes stale, though — a session is handed the
+# rate_limits from its LAST API response, so one left idle replays frozen numbers for as
+# long as it sits there.
+#
+# So the report also fetches from the endpoint /usage reads, signed with the OAuth token
+# Claude Code already stores, to repair exactly that staleness. That fetch is THROTTLED
+# (CLAUDE_USAGE_FETCH_SECS, default 300): the endpoint's budget is per-account and shared
+# with Claude Code's own polling from every running session, and it answers 429 for minutes
+# on end once that budget is spent. Fetching on every repaint spends it for no gain — usage
+# only moves while a session is working, which is precisely when the hook is already firing.
+#
+# Register the hook in
+# ~/.claude/settings.json (swap in --refresh to keep the cache warm with no status line):
+#
+#   "statusLine": {
+#     "type": "command",
+#     "command": "/usr/local/bin/claude-usage --statusline",
+#     "refreshInterval": 60
+#   }
+
+set -euo pipefail
+
+CACHE="${CLAUDE_USAGE_CACHE:-$HOME/.claude/usage-cache.json}"
+CREDS="${CLAUDE_USAGE_CREDENTIALS:-$HOME/.claude/.credentials.json}"
+ACCOUNT="${CLAUDE_USAGE_ACCOUNT:-$HOME/.claude.json}"
+GATE="${CACHE}.next-fetch"
+FETCH_SECS="${CLAUDE_USAGE_FETCH_SECS:-300}"
+BACKOFF_SECS="${CLAUDE_USAGE_BACKOFF_SECS:-1800}"
+API="${CLAUDE_USAGE_API:-https://api.anthropic.com}"
+BAR_WIDTH="${CLAUDE_USAGE_BAR_WIDTH:-30}"
+
+MODE=live
+INTERVAL=60
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --statusline) MODE=statusline ;;
+    --refresh)    MODE=refresh ;;
+    --secs)       shift; INTERVAL="${1:-}" ;;
+    *[0-9]*)      INTERVAL="$1" ;;   # bare number: claude-usage 30
+  esac
+  shift
+done
+case "$INTERVAL" in
+  ''|*[!0-9]*|0) echo "claude-usage: --secs needs a positive whole number of seconds" >&2; exit 2 ;;
+esac
+
+# Always colored — every surface this runs on renders ANSI: a real tty,
+# `!claude-usage` inside Claude Code, and the statusline command.
+R=$'\033[0m'; DIM=$'\033[2m'; BOLD=$'\033[1m'
+GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+# Usage bar in Claude coral (#d97757), elapsed-time bar in blue (#4a90d9), over-pace
+# warning in terracotta (#c85a54) — hot enough to read as a warning, without plain
+# ANSI red's alarm-bell clash against the warm bars it sits under.
+# Each bar also carries a *background* track (a dark tint of its own color). The track
+# has to be a real background, not a ░ glyph: a partial block paints only part of its
+# cell, so with no background behind it the remainder shows raw terminal bg as a gap.
+case "${COLORTERM:-}" in
+  truecolor|24bit)
+    CORAL=$'\033[38;2;217;119;87m'; CORAL_BG=$'\033[48;2;83;58;54m'
+    BLUE=$'\033[38;2;74;144;217m';  BLUE_BG=$'\033[48;2;43;65;90m'
+    RED=$'\033[38;2;200;90;84m' ;;
+  *)
+    CORAL=$'\033[38;5;173m';        CORAL_BG=$'\033[48;5;237m'
+    BLUE=$'\033[38;5;68m';          BLUE_BG=$'\033[48;5;237m'
+    RED=$'\033[38;5;167m' ;;
+esac
+
+# ---------------------------------------------------------------- helpers
+
+bar() { # bar <pct> [width]
+  awk -v p="$1" -v w="${2:-$BAR_WIDTH}" 'BEGIN {
+    # Eighth-width blocks subdivide each cell 8 ways, so a 30-cell bar resolves
+    # ~0.42% instead of 3.3% — 1% reads as a sliver instead of an empty track.
+    # Assign the glyphs one by one: mawk cuts split("…", a, "") on byte boundaries,
+    # which shreds multi-byte UTF-8.
+    part[1]="▏"; part[2]="▎"; part[3]="▍"; part[4]="▌"
+    part[5]="▋"; part[6]="▊"; part[7]="▉"
+    if (p < 0) p = 0; if (p > 100) p = 100
+    cells = p * w / 100
+    full  = int(cells)
+    idx   = int((cells - full) * 8 + 0.5)
+    if (idx == 8) { full++; idx = 0 }
+    if (full >= w && p < 100) { full = w - 1; idx = 7 }  # a full bar means finished
+    if (full == 0 && idx == 0 && p > 0) idx = 1          # never render nonzero as empty
+    for (i = 0; i < full; i++) printf "█"
+    if (idx > 0) { printf "%s", part[idx]; full++ }
+    for (i = full; i < w; i++) printf " "   # blank — the caller paints the track behind it
+  }'
+}
+
+duration() { # duration <seconds> -> "4d 3h" / "1h 36m" / "12m"
+  awk -v s="$1" 'BEGIN {
+    s = int(s); if (s < 0) s = 0
+    d = int(s / 86400); s -= d * 86400
+    h = int(s / 3600);  s -= h * 3600
+    m = int(s / 60)
+    if (d > 0)      printf "%dd %dh", d, h
+    else if (h > 0) printf "%dh %dm", h, m
+    else            printf "%dm", m
+  }'
+}
+
+when() { # when <epoch> -> "Wed 7:00 AM" / "Wed Aug 19 7:00 AM" past a week
+  local ts="$1"
+  if [ $(( ts - $(date +%s) )) -lt 518400 ]; then
+    date -d "@$ts" '+%a %-I:%M %p'                    # within 6d — the weekday is unambiguous
+  else
+    date -d "@$ts" '+%a %b %-d %-I:%M %p'             # further out — spell out the date too
+  fi
+}
+
+# How much of the window has gone by, as a percentage, clamped to [0,100].
+elapsed_pct() { # elapsed_pct <now> <resets_at> <span>
+  awk -v n="$1" -v r="$2" -v s="$3" \
+    'BEGIN { p = (s - (r - n)) / s * 100; if (p < 0) p = 0; if (p > 100) p = 100; printf "%.1f", p }'
+}
+
+# pace = usage share divided by elapsed share. 1.0 is exactly an even burn.
+pace() { awk -v u="$1" -v e="$2" 'BEGIN { if (e <= 0) print "" ; else printf "%.2f", u / e }'; }
+
+# Seconds of idling before usage% and elapsed% meet — i.e. pace back down to 1.0.
+# Sitting out freezes usage% while elapsed% keeps climbing at 100/span per second, so
+# the gap between the two bars converts straight into time. Because usage% can't exceed
+# 100 the answer is always within the window: at 100% used it lands exactly on the reset.
+# Already at or under parity (gap <= 0) -> 0.
+parity_secs() { # parity_secs <used%> <elapsed%> <span>
+  awk -v u="$1" -v e="$2" -v s="$3" 'BEGIN { w = s * (u - e) / 100; printf "%d", (w > 0 ? w : 0) }'
+}
+
+pace_color() {
+  [ -z "$1" ] && { printf '%s' "$DIM"; return; }
+  awk -v p="$1" -v g="$GREEN" -v y="$YELLOW" -v r="$RED" \
+    'BEGIN { print (p <= 1.0 ? g : (p <= 1.25 ? y : r)) }'
+}
+
+# Whose plan these figures are counting against, read from the login state Claude Code
+# maintains — the same account /status names. Free and local, so it is re-read on every
+# repaint rather than frozen at startup: a report that reads a new account's numbers should
+# not keep the old account's name over them.
+#
+# Empty when there is no OAuth account on file, which is the honest answer for an API-key
+# setup: the report still works there, it just has no one to name.
+account_label() {
+  local email org
+  [ -r "$ACCOUNT" ] || return 0
+  IFS=$'\t' read -r email org < <(jq -r '.oauthAccount // {}
+    | [(.emailAddress // ""), (.organizationName // "")] | @tsv' "$ACCOUNT" 2>/dev/null) || return 0
+  [ -n "$email" ] || { printf '%s' "$org"; return 0; }
+  # A personal plan's organization is auto-named "<email>'s Organization" — pure noise
+  # beside the address it repeats. A workspace someone actually named is worth showing.
+  # Plain string equality rather than a case pattern: the expected name embeds an
+  # apostrophe, which is a quoting hazard in a pattern and means nothing useful as a glob.
+  if [ -z "$org" ] || [ "$org" = "$email" ] || [ "$org" = "${email}'s Organization" ]; then
+    printf '%s' "$email"
+  else
+    printf '%s · %s' "$email" "$org"
+  fi
+}
+
+# Pull the live figures from the endpoint /usage itself reads and write them into the cache
+# in the shape the statusLine hook uses, so everything downstream is unchanged. Returns
+# nonzero — leaving whatever is cached in place — on any missing piece: no credentials file,
+# an expired token, no network, a response without the two windows in it.
+#
+# Deliberately read-only with respect to the credentials: an expired access token is a dead
+# end here, not something to refresh. Refreshing rotates the refresh token, and racing
+# Claude Code for that rotation would sign the user out of the CLI.
+# When the figures themselves next move, which is what the footer should be counting down —
+# the repaint interval only redraws the same numbers against a longer time bar. Throttled, so
+# this is the fetch gate, and a 429 stretches it to half an hour. Minutes only — a countdown
+# ticking through seconds draws the eye to the one number on screen that does not matter, so
+# the last minute just reads "1m" rather than "0m" or a second-by-second crawl. Always says
+# something: with no gate yet written, or
+# one already elapsed, a fetch goes out on the very next repaint — and in the one case where
+# it cannot (no token to sign with), "due" still reads true against the data age beside the
+# title and the stale verdict under the bars, both of which are already saying so.
+next_update_note() {
+  local gate now left
+  gate="$(cat "$GATE" 2>/dev/null || true)"
+  case "$gate" in ''|*[!0-9]*) gate=0 ;; esac
+  now="$(date +%s)"
+  left=$(( gate - now ))
+  if   [ "$left" -le 0 ];  then printf 'Next update due · '
+  elif [ "$left" -lt 60 ]; then printf 'Next update in 1m · '
+  else                          printf 'Next update in %s · ' "$(duration "$left")"; fi
+}
+
+# Earliest second at which another fetch may go out. Absent or unreadable reads as "now",
+# so a fresh install fetches immediately.
+gate_set() { printf '%s\n' "$1" > "$GATE" 2>/dev/null || true; }
+
+refresh_from_api() {
+  local tok exp now resp code gate u5 r5 u7 r7 tmp
+  command -v curl >/dev/null 2>&1 || return 1
+  [ -r "$CREDS" ] || return 1
+  now="$(date +%s)"
+  IFS=$'\t' read -r tok exp < <(jq -r \
+    '.claudeAiOauth // {} | [(.accessToken // ""), (.expiresAt // 0)] | @tsv' "$CREDS" 2>/dev/null) || return 1
+  [ -n "$tok" ] || return 1
+  # expiresAt is in milliseconds. awk rather than [ -gt ] because the field comes straight
+  # out of JSON, where a float would make bash's integer test bail rather than compare.
+  awk -v e="$exp" -v n="$now" 'BEGIN { exit !(e > n * 1000) }' || return 1
+
+  # The throttle. Skipping a fetch is not a failure to report: the cache it leaves in place
+  # is usually seconds old, written by the statusLine hook on some session's last turn.
+  gate="$(cat "$GATE" 2>/dev/null || true)"
+  case "$gate" in ''|*[!0-9]*) gate=0 ;; esac
+  [ "$now" -ge "$gate" ] || return 1
+
+  # -s, no stderr: a failure here is an ordinary fall-back-to-cache, and a stray curl
+  # error line would land in the middle of a repainting frame.
+  resp="$(curl -s --max-time 5 -w '\n%{http_code}' \
+    -H "Authorization: Bearer $tok" \
+    -H 'anthropic-beta: oauth-2025-04-20' \
+    -H 'Content-Type: application/json' \
+    "$API/api/oauth/usage")" || { gate_set $(( now + 60 )); return 1; }
+  code="${resp##*$'\n'}"
+  resp="${resp%$'\n'*}"
+  case "$code" in
+    200) ;;
+    # Measured, not guessed: once this endpoint starts refusing it kept refusing for at
+    # least two solid minutes, and its retry-after header said 0. Back well off instead.
+    429) gate_set $(( now + BACKOFF_SECS )); return 1 ;;
+    *)   gate_set $(( now + 60 )); return 1 ;;
+  esac
+  IFS=$'\t' read -r u5 r5 u7 r7 < <(printf '%s' "$resp" | jq -r '
+    [ (.five_hour.utilization // ""), (.five_hour.resets_at // ""),
+      (.seven_day.utilization // ""), (.seven_day.resets_at // "") ] | @tsv' 2>/dev/null) || return 1
+  [ -n "$u5" ] && [ -n "$r5" ] && [ -n "$u7" ] && [ -n "$r7" ] || return 1
+  # date -d, not jq's fromdateiso8601: the API stamps carry fractional seconds and a
+  # +00:00 offset, and jq's strptime accepts neither.
+  r5="$(date -d "$r5" +%s 2>/dev/null)" || return 1
+  r7="$(date -d "$r7" +%s 2>/dev/null)" || return 1
+
+  tmp="$(mktemp "${CACHE}.XXXXXX")" || return 1
+  jq -n --argjson now "$now" \
+        --argjson u5 "$u5" --argjson r5 "$r5" \
+        --argjson u7 "$u7" --argjson r7 "$r7" \
+    '{captured_at: $now, rate_limits: {
+        five_hour: {used_percentage: $u5, resets_at: $r5},
+        seven_day: {used_percentage: $u7, resets_at: $r7}}}' > "$tmp" 2>/dev/null \
+    || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$CACHE"
+  gate_set $(( now + FETCH_SECS ))
+}
+
+# ---------------------------------------------------------------- statusline modes
+
+# Both --statusline and --refresh run as the registered statusLine command (the only
+# thing Claude Code hands rate_limits to). They differ only in whether a line renders:
+# --statusline prints the compact readout, --refresh stays silent and just warms the
+# cache for `claude-usage` / `--live`.
+if [ "$MODE" = statusline ] || [ "$MODE" = refresh ]; then
+  payload="$(cat)"
+  now="$(date +%s)"
+
+  # Two conditions to write. This session has to have actually carried rate_limits, so one
+  # without them (API key, endpoint rate-limited) doesn't blank the cache out. And the
+  # 5-hour window those figures describe has to still be OPEN: a session is handed the
+  # rate_limits from its LAST API response, so an idle one replays a frozen snapshot every
+  # 60 seconds, and once its window has rolled past, that snapshot is provably history —
+  # it must not land on top of figures the report fetched live.
+  #
+  # An expired window is the honest staleness test. Keeping whichever usage figure is
+  # larger is NOT: usage does fall within a window when the counters are reset server-side,
+  # and a rule that only ratchets upward would pin the pre-reset number there for a week.
+  if printf '%s' "$payload" | jq -e --argjson now "$now" \
+      '(.rate_limits.seven_day.resets_at != null) and (.rate_limits.five_hour.resets_at > $now)' \
+      >/dev/null 2>&1; then
+    tmp="$(mktemp "${CACHE}.XXXXXX")"
+    printf '%s' "$payload" \
+      | jq --argjson now "$now" '{captured_at: $now, rate_limits: .rate_limits}' > "$tmp"
+    mv -f "$tmp" "$CACHE"
+  fi
+
+  if [ "$MODE" = refresh ]; then exit 0; fi
+
+  # Split on the TAB @tsv emits — model display names contain spaces ("Opus 5"),
+  # so collapsing the tab to a space would split the name into the dir field.
+  IFS=$'\t' read -r model dir < <(printf '%s' "$payload" | jq -r '
+    [ (.model.display_name // "?"),
+      ((.workspace.current_dir // .cwd // "") | split("/") | last // "?")
+    ] | @tsv')
+
+  line="${DIM}${model} · ${dir}${R}"
+
+  summary=""
+  for w in five_hour:18000:5h seven_day:604800:7d; do
+    IFS=: read -r key span label <<< "$w"
+    read -r used resets < <(printf '%s' "$payload" \
+      | jq -r --arg k "$key" '.rate_limits[$k] // {} | [(.used_percentage // ""), (.resets_at // "")] | @tsv')
+    [ -z "$used" ] || [ -z "$resets" ] && continue
+    elapsed="$(elapsed_pct "$now" "$resets" "$span")"
+    p="$(pace "$used" "$elapsed")"
+    c="$(pace_color "$p")"
+    summary="${summary}  ${DIM}${label}${R} $(printf '%.0f' "$used")%${c}$([ -n "$p" ] && printf ' %sx' "$p")${R}"
+  done
+
+  printf '%s%s\n' "$line" "$summary"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- report mode
+
+# One preflight attempt, before deciding there is nothing to show. render_report attempts
+# again on its first pass a moment later, which costs nothing: the gate this one just wrote
+# turns that second attempt away.
+refresh_from_api || true
+
+if [ ! -f "$CACHE" ]; then
+  echo "claude-usage: no usage data — could not reach the API, and nothing cached at $CACHE" >&2
+  echo >&2
+  echo "The live fetch needs a Claude Code OAuth login (an unexpired token in" >&2
+  echo "$CREDS). Failing that, Claude Code hands rate_limits to a statusLine" >&2
+  echo "command, so add this to ~/.claude/settings.json and run one Claude Code turn to" >&2
+  echo "prime the cache (use --refresh instead of --statusline for no visible status line):" >&2
+  echo >&2
+  echo '  "statusLine": { "type": "command", "command": "/usr/local/bin/claude-usage --statusline", "refreshInterval": 60 }' >&2
+  exit 1
+fi
+
+render_report() {
+local now captured w key span label used resets elapsed elapsed_disp p c projected verdict note
+local parity secs parity_note source_note whose
+
+# Offer a fetch on every repaint; the throttle inside decides whether one actually goes out,
+# so most passes render from the cache the statusLine hook keeps current.
+#
+# The throttle has to live in a FILE, and the reason is this function's caller: the live loop
+# renders each frame inside a command substitution, which is a subshell, so any variable this
+# sets is thrown away when the frame is built. Only what lands on disk survives to the next
+# repaint.
+refresh_from_api || true
+
+now="$(date +%s)"
+captured="$(jq -r '.captured_at' "$CACHE")"
+
+# Header pre-pass: the idle time that would bring EVERY over-pace window back to parity,
+# which is simply the longest of the individual waits — sitting out the slowest one carries
+# the others past their own crossings on the way. Has to run before the header prints, hence
+# a separate walk over the same two windows rather than folding into the render loop below.
+parity=0
+for w in five_hour:18000 seven_day:604800; do
+  IFS=: read -r key span <<< "$w"
+  read -r used resets < <(jq -r --arg k "$key" \
+    '.rate_limits[$k] // {} | [(.used_percentage // ""), (.resets_at // "")] | @tsv' "$CACHE")
+  [ -z "$used" ] || [ -z "$resets" ] && continue
+  [ "$now" -ge "$resets" ] && continue        # stale cache: window already rolled, pace is unknown
+  secs="$(parity_secs "$used" "$(elapsed_pct "$now" "$resets" "$span")" "$span")"
+  [ "$secs" -gt "$parity" ] && parity="$secs"
+done
+
+# Only surfaced when usage is actually ahead of time — under parity there is nothing to wait
+# out. Suppressed below a minute too, so it never renders as "0m of idle".
+parity_note=""
+# The duration drops out of the surrounding dim run so the figure itself reads full-white,
+# then hands the dim back for the trailing label.
+[ "$parity" -ge 60 ] && parity_note="  —  ${R}$(duration "$parity")${DIM} of idle until parity"
+
+# Age, not provenance. Which mechanism last wrote the cache says nothing about whether the
+# figures are current — the hook writing on an active session's turn is fresher than a
+# throttled fetch. So say how old they actually are, and stay quiet while they are current.
+source_note=""
+[ $(( now - captured )) -ge 120 ] && source_note=" · $(duration $(( now - captured ))) old"
+
+printf '\n  %sClaude usage%s %sas of %s%s%s%s\n' \
+  "$BOLD" "$R" "$DIM" "$(date -d "@$captured" '+%-I:%M %p %b %-d')" "$source_note" "$parity_note" "$R"
+
+# Dim, on its own line under the title: it answers "whose numbers are these" for anyone who
+# needs to ask, and stays out of the way of the bars for everyone who does not.
+whose="$(account_label)"
+[ -n "$whose" ] && printf '  %s%s%s\n' "$DIM" "$whose" "$R"
+
+for w in five_hour:18000:"5-hour" seven_day:604800:"7-day"; do
+  IFS=: read -r key span label <<< "$w"
+
+  read -r used resets < <(jq -r --arg k "$key" \
+    '.rate_limits[$k] // {} | [(.used_percentage // ""), (.resets_at // "")] | @tsv' "$CACHE")
+  # Every branch below feeds the SAME three-line block (usage bar / time bar / verdict) —
+  # missing or stale data renders empty bars rather than collapsing to a short stanza, so
+  # the report keeps a fixed shape and nothing jumps between frames in the live loop.
+  if [ -z "$used" ] || [ -z "$resets" ]; then
+    used=0; elapsed=0; note=""
+    verdict="${DIM}no data — run a Claude Code turn to refresh${R}"
+  elif [ "$now" -ge "$resets" ]; then
+    # The cache predates the rollover: this window has already reset, we just weren't told.
+    elapsed=100
+    note="$(printf '   %sreset %s ago%s' "$DIM" "$(duration $(( now - resets )))" "$R")"
+    verdict="${DIM}stale — run a Claude Code turn to refresh${R}"
+  else
+    elapsed="$(elapsed_pct "$now" "$resets" "$span")"
+    note="$(printf '   %s%s left%s' "$DIM" "$(duration $(( resets - now )))" "$R")"
+    p="$(pace "$used" "$elapsed")"
+    c="$(pace_color "$p")"
+    if [ -z "$p" ]; then
+      # elapsed is 0 — the window just rolled, so pace/projection are undefined (0/0).
+      # Render them as zeros to hold the layout instead of swapping in a prose line.
+      verdict="$(printf '%s0.00x pace%s — tracking to 0%% by reset %son %s%s' \
+        "$DIM" "$R" "$DIM" "$(when "$resets")" "$R")"
+    else
+      projected="$(awk -v u="$used" -v e="$elapsed" 'BEGIN { printf "%.0f", u / e * 100 }')"
+      verdict="$(printf '%s%sx pace%s — tracking to %d%% by reset %son %s%s' \
+        "$c" "$p" "$R" "$projected" "$DIM" "$(when "$resets")" "$R")"
+    fi
+  fi
+
+  # Floor the elapsed figure for display: 99.6% with 41m still on the clock should
+  # read 99%, not 100% — 100 is reserved for a window that has actually closed.
+  # Pace and projection above keep the unrounded value.
+  elapsed_disp="$(awk -v e="$elapsed" 'BEGIN { printf "%d", int(e) }')"
+
+  printf '\n  %s%-8s%s %susage%s  %s%s%s %3.0f%%\n' \
+    "$BOLD" "$label" "$R" "$DIM" "$R" "$CORAL$CORAL_BG" "$(bar "$used")" "$R" "$used"
+  printf '  %-8s %stime %s  %s%s%s %3d%%%s\n' \
+    '' "$DIM" "$R" "$BLUE$BLUE_BG" "$(bar "$elapsed")" "$R" "$elapsed_disp" "$note"
+  printf '  %-8s %s\n' '' "$verdict"
+done
+}
+
+# ---------------------------------------------------------------- dispatch
+
+# Not a terminal (piped, redirected, captured in $(…))? Render once and exit — the
+# repaint escapes would corrupt the stream and the loop would never terminate.
+if [ ! -t 1 ]; then
+  render_report
+  exit 0
+fi
+
+# live — repaint in place, wiping scrollback so the pane holds one report.
+printf '\033[?25l\033[H\033[2J\033[3J'          # hide cursor, wipe pane + scrollback once
+# On the way out (ctrl-c included): restore the cursor and wipe the report, leaving a
+# clean prompt. Nothing is lost — the pane only ever holds the one report.
+trap 'printf "\033[?25h\033[H\033[2J\033[3J"' EXIT
+while :; do
+  # Render into a string BEFORE painting: render_report shells out to jq/awk/date a
+  # dozen times, so clearing first would leave the pane blank for that whole stretch —
+  # that gap is the flash. The old frame stays up until the new one overwrites it.
+  frame="$(render_report; printf '\n  %s%sctrl-c to exit%s' \
+    "$DIM" "$(next_update_note)" "$R")"
+  # One write, no clear: home the cursor and overprint. \033[K ends every line so a
+  # shorter frame can't leave a tail of the longer one behind, and \033[J drops
+  # anything below the last line.
+  printf '\033[H%s\033[K\n\033[J' "${frame//$'\n'/$'\033[K\n'}"
+  sleep "$INTERVAL"
+done
+
+echo
