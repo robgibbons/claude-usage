@@ -6,22 +6,14 @@ Claude Code plan usage, framed against the time left in the same window.
 whether that's fine. This does: for each rate-limit window it draws the usage bar, and
 directly beneath it a bar for how much of the window has actually elapsed.
 
+**Example**
+
+<img width="594" height="251" alt="image" src="https://github.com/user-attachments/assets/e6e4ee5a-4410-43b6-9a2a-cdbe88f8e4ab" />
+
+
 **If the usage bar is longer than the time bar, you're spending faster than an even split.**
 
-```
-  Claude usage as of 10:11 PM Oct 6
-  you@example.com
-
-  5-hour   usage  ███████████▌                    38%
-           time   ██████▏                         20%   4h 0m left
-           1.90x pace — tracking to 190% by reset on Wed 3:00 AM
-
-  7-day    usage  ██▍                              8%
-           time   █████████▏                      30%   4d 20h left
-           0.26x pace — tracking to 26% by reset on Sun 7:00 PM
-
-  Next update in 4m · ctrl-c to exit
-```
+<img width="594" height="251" alt="image" src="https://github.com/user-attachments/assets/7713ba68-1b51-46a1-89bc-46d5c1aeba21" />
 
 Each window gets a pace figure (usage share ÷ elapsed share — `1.00x` is exactly an even
 burn) and a projection of where you land at this rate. The header adds how long you'd have
